@@ -1,0 +1,289 @@
+//+------------------------------------------------------------------+
+//|                                              BLUE_DRAGON_1_2_5.mq5 |
+//|                                  Copyright 2023, Alchemy Technologies |
+//|                                                  bluedragon.ai |
+//+------------------------------------------------------------------+
+
+#property copyright "Copyright 2023, Alchemy Technologies"
+#property link "bluedragon.ai"
+#property version "1.25"
+#property strict
+
+#include <Trade\Trade.mqh>
+
+input int EMA10Period = 10;
+input int EMA62Period = 62;
+input double TakeProfit = 20000.0; // Take Profit
+input double StopLossPips = 100.0; // Stop Loss
+input int MaxConsecutiveLosses = 2;
+input double TradingPauseHours = 40.0;
+input int TradesIn24Hours = 1;
+input double TrailingStopPips = 50.0; // Trailing Stop
+
+
+int ema10_handle;
+int EMA62_handle;
+
+CTrade trade;
+double EMA10[];
+double EMA62[];
+int consecutiveLosses = 0;
+datetime lastTradeTime;
+
+// Global variable for StopLoss
+double StopLoss;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   ArraySetAsSeries(EMA10, true);
+   ArraySetAsSeries(EMA62, true);
+
+   ema10_handle = iMA(_Symbol, _Period, EMA10Period, 0, MODE_EMA, PRICE_CLOSE);
+   EMA62_handle = iMA(_Symbol, _Period, EMA62Period, 0, MODE_EMA, PRICE_CLOSE);
+
+   if (_Digits == 3 || _Digits == 5)
+       StopLoss = StopLossPips * 10.0;
+   else
+       StopLoss = StopLossPips * 1.0;
+
+   return(INIT_SUCCEEDED);
+}
+//+------------------------------------------------------------------+
+
+// Global variable to store the number of trades in the last 24 hours
+int tradesInLast24Hours = 0;
+
+// Global variable for Lot Size
+double LotSize = 5.0;
+datetime lastCheckedMonth;
+
+double initialBalance;
+
+
+//+------------------------------------------------------------------+
+//| Update the Lot Size at the start of each month                   |
+//+------------------------------------------------------------------+
+void updateLotSize()
+{
+   datetime currentTime = TimeTradeServer();
+   MqlDateTime mqlTime;
+   TimeToStruct(currentTime, mqlTime);
+
+   if (lastCheckedMonth == 0) // First time initialization
+   {
+      lastCheckedMonth = mqlTime.mon;
+      initialBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   }
+   else if (mqlTime.mon != lastCheckedMonth) // New month detected
+   {
+      double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+      double profitPercentage = ((currentBalance - initialBalance) / initialBalance) * 100;
+
+      if (profitPercentage >= 15.0)
+      {
+         LotSize += 3.0;
+      }
+
+      lastCheckedMonth = mqlTime.mon;
+      initialBalance = currentBalance;
+   }
+}
+
+
+
+//+------------------------------------------------------------------+
+//| Update the tradesInLast24Hours variable                          |
+//+------------------------------------------------------------------+
+void updateTradesInLast24Hours()
+{
+   tradesInLast24Hours = 0;
+   datetime currentTime = TimeTradeServer();
+   datetime time24HoursAgo = currentTime - (24 * 3600);
+
+   for (int i = 0; i < HistoryDealsTotal(); i++)
+   {
+      ulong dealTicket = HistoryDealGetTicket(i);
+      if (dealTicket == 0)
+         continue;
+
+      datetime dealTime;
+      if (!HistoryDealGetInteger(dealTicket, DEAL_TIME, dealTime))
+         continue;
+
+      if (dealTime > time24HoursAgo)
+      {
+         tradesInLast24Hours++;
+      }
+      else
+      {
+         break;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // Update the lot size at the start of each month
+   updateLotSize();
+   
+   // Update the tradesInLast24Hours variable
+   updateTradesInLast24Hours();
+
+   // Call the Trailing Stop function
+   TrailingStop();
+
+   // Check if the maximum number of trades in 24 hours has been reached
+   if (tradesInLast24Hours >= TradesIn24Hours)
+      return;
+
+   // Check for open positions
+   bool hasOpenPosition = false;
+   for (int i = 0; i < PositionsTotal(); i++)
+   {
+      if (PositionGetSymbol(i) == _Symbol)
+      {
+         hasOpenPosition = true;
+         break;
+      }
+   }
+
+   if (hasOpenPosition)
+      return;
+
+   if (consecutiveLosses >= MaxConsecutiveLosses && TimeTradeServer() - lastTradeTime < TradingPauseHours * 3600)
+      return;
+
+   double EMA10_Current;
+   double EMA10_Previous;
+   double EMA62_Current;
+   double EMA62_Previous;
+
+   CopyBuffer(ema10_handle, 0, 0, 2, EMA10);
+   CopyBuffer(EMA62_handle, 0, 0, 2, EMA62);
+
+   EMA10_Current = EMA10[0];
+   EMA10_Previous = EMA10[1];
+
+   EMA62_Current = EMA62[0];
+   EMA62_Previous = EMA62[1];
+
+   MqlTick last_tick;
+   SymbolInfoTick(_Symbol, last_tick);
+   double lastBid = NormalizeDouble(last_tick.bid, _Digits);
+   double lastAsk = NormalizeDouble(last_tick.ask, _Digits);
+
+if (EMA10_Previous < EMA62_Previous && EMA10_Current > EMA62_Current) // Buy signal
+{
+   double buyStopLoss = lastAsk - StopLoss * _Point;
+   double buyTakeProfit = lastAsk + TakeProfit * _Point;
+   if (trade.Buy(LotSize, _Symbol, lastAsk, buyStopLoss, buyTakeProfit))
+      consecutiveLosses = 0;
+}
+else if (EMA10_Previous > EMA62_Previous && EMA10_Current < EMA62_Current) // Sell signal
+{
+   double sellStopLoss = lastBid + StopLoss * _Point;
+   double sellTakeProfit = lastBid - TakeProfit * _Point;
+   if (trade.Sell(LotSize, _Symbol, lastBid, sellStopLoss, sellTakeProfit))
+      consecutiveLosses = 0;
+}
+
+
+}
+
+
+//+------------------------------------------------------------------+
+
+// Global variables to store the opening price and volume
+double openPrice = 0;
+double openVolume = 0;
+
+///+------------------------------------------------------------------+
+//| TradeTransaction function                                        |
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction& trans, const MqlTradeRequest& request, const MqlTradeResult& result)
+{
+   if (trans.type == TRADE_TRANSACTION_DEAL_ADD && trans.deal != 0 && result.retcode == TRADE_RETCODE_DONE)
+   {
+      double calculated_profit;
+      ENUM_ORDER_TYPE order_type = (trans.order_type == ORDER_TYPE_BUY || trans.order_type == ORDER_TYPE_BUY_LIMIT || trans.order_type == ORDER_TYPE_BUY_STOP) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+
+      if (OrderCalcProfit(order_type, _Symbol, trans.volume, trans.price, trans.price, calculated_profit))
+      {
+         if (calculated_profit < 0)
+            consecutiveLosses++;
+         else
+            consecutiveLosses = 0;
+
+         lastTradeTime = TimeTradeServer();
+      }
+   }
+}
+//+------------------------------------------------------------------+
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   // Add any necessary clean up
+   // code here if needed
+   
+}
+
+//+------------------------------------------------------------------+
+//| Trailing Stop function                                           |
+//+------------------------------------------------------------------+
+void TrailingStop()
+{
+   double trailingStop;
+
+   if (_Digits == 3 || _Digits == 5)
+      trailingStop = TrailingStopPips * 10.0;
+   else
+      trailingStop = TrailingStopPips * 1.0;
+
+   MqlTick last_tick;
+   SymbolInfoTick(_Symbol, last_tick);
+   double lastBid = NormalizeDouble(last_tick.bid, _Digits);
+   double lastAsk = NormalizeDouble(last_tick.ask, _Digits);
+
+   for (int i = 0; i < PositionsTotal(); i++)
+   {
+      if (PositionGetSymbol(i) == _Symbol)
+      {
+         double currentStopLoss = PositionGetDouble(POSITION_SL);
+         double positionOpenPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+         double currentPositionProfit = PositionGetDouble(POSITION_PROFIT);
+
+         if (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+         {
+            if (currentPositionProfit > 0 && currentPositionProfit > trailingStop * _Point)
+            {
+               double newStopLoss = lastBid - trailingStop * _Point;
+
+               if (currentStopLoss == 0 || newStopLoss > currentStopLoss)
+                  trade.PositionModify(PositionGetTicket(i), newStopLoss, PositionGetDouble(POSITION_TP));
+            }
+         }
+         else if (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
+         {
+            if (currentPositionProfit > 0 && currentPositionProfit > trailingStop * _Point)
+            {
+               double newStopLoss = lastAsk + trailingStop * _Point;
+
+               if (currentStopLoss == 0 || newStopLoss < currentStopLoss)
+                  trade.PositionModify(PositionGetTicket(i), newStopLoss, PositionGetDouble(POSITION_TP));
+            }
+         }
+      }
+   }
+}
+
+
+//+------------------------------------------------------------------+
